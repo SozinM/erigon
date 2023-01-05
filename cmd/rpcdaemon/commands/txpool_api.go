@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/ledgerwatch/log/v3"
 
 	"github.com/ledgerwatch/erigon-lib/gointerfaces"
 	proto_txpool "github.com/ledgerwatch/erigon-lib/gointerfaces/txpool"
@@ -59,17 +60,17 @@ func (api *TxPoolAPIImpl) Content(ctx context.Context) (map[string]map[string]ma
 		}
 		addr := gointerfaces.ConvertH160toAddress(reply.Txs[i].Sender)
 		switch reply.Txs[i].TxnType {
-		case proto_txpool.AllReply_PENDING:
+		case proto_txpool.Txn_PENDING:
 			if _, ok := pending[addr]; !ok {
 				pending[addr] = make([]types.Transaction, 0, 4)
 			}
 			pending[addr] = append(pending[addr], txn)
-		case proto_txpool.AllReply_BASE_FEE:
+		case proto_txpool.Txn_BASE_FEE:
 			if _, ok := baseFee[addr]; !ok {
 				baseFee[addr] = make([]types.Transaction, 0, 4)
 			}
 			baseFee[addr] = append(baseFee[addr], txn)
-		case proto_txpool.AllReply_QUEUED:
+		case proto_txpool.Txn_QUEUED:
 			if _, ok := queued[addr]; !ok {
 				queued[addr] = make([]types.Transaction, 0, 4)
 			}
@@ -129,6 +130,94 @@ func (api *TxPoolAPIImpl) Status(ctx context.Context) (map[string]hexutil.Uint, 
 		"baseFee": hexutil.Uint(reply.BaseFeeCount),
 		"queued":  hexutil.Uint(reply.QueuedCount),
 	}, nil
+}
+
+// Search returns transaction from pending pool that meets passed filter with a limit.
+func (api *TxPoolAPIImpl) Search(ctx context.Context, limit uint32, filter SearchFilter) (map[string]map[string]map[string]*RPCTransaction, error) {
+	log.Info("Search")
+	reply, err := api.pool.Search(ctx, &proto_txpool.SearchRequest{Limit: &limit, Filter: &proto_txpool.SearchRequest_Filter{From: filter.From[:]}})
+	if err != nil {
+		return nil, err
+	}
+
+	content := map[string]map[string]map[string]*RPCTransaction{
+		"pending": make(map[string]map[string]*RPCTransaction),
+		"baseFee": make(map[string]map[string]*RPCTransaction),
+		"queued":  make(map[string]map[string]*RPCTransaction),
+	}
+
+	pending := make(map[common.Address][]types.Transaction, 8)
+	baseFee := make(map[common.Address][]types.Transaction, 8)
+	queued := make(map[common.Address][]types.Transaction, 8)
+	for i := range reply.Txs {
+		stream := rlp.NewStream(bytes.NewReader(reply.Txs[i].RlpTx), 0)
+		txn, err := types.DecodeTransaction(stream)
+		if err != nil {
+			return nil, err
+		}
+		addr := gointerfaces.ConvertH160toAddress(reply.Txs[i].Sender)
+		switch reply.Txs[i].TxnType {
+		case proto_txpool.Txn_PENDING:
+			if _, ok := pending[addr]; !ok {
+				pending[addr] = make([]types.Transaction, 0, 4)
+			}
+			pending[addr] = append(pending[addr], txn)
+		case proto_txpool.Txn_BASE_FEE:
+			if _, ok := baseFee[addr]; !ok {
+				baseFee[addr] = make([]types.Transaction, 0, 4)
+			}
+			baseFee[addr] = append(baseFee[addr], txn)
+		case proto_txpool.Txn_QUEUED:
+			if _, ok := queued[addr]; !ok {
+				queued[addr] = make([]types.Transaction, 0, 4)
+			}
+			queued[addr] = append(queued[addr], txn)
+		}
+	}
+
+	tx, err := api.db.BeginRo(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	cc, err := api.chainConfig(tx)
+	if err != nil {
+		return nil, err
+	}
+
+	curHeader := rawdb.ReadCurrentHeader(tx)
+	if curHeader == nil {
+		return nil, nil
+	}
+	// Flatten the pending transactions
+	for account, txs := range pending {
+		dump := make(map[string]*RPCTransaction)
+		for _, txn := range txs {
+			dump[fmt.Sprintf("%d", txn.GetNonce())] = newRPCPendingTransaction(txn, curHeader, cc)
+		}
+		content["pending"][account.Hex()] = dump
+	}
+	// Flatten the baseFee transactions
+	for account, txs := range baseFee {
+		dump := make(map[string]*RPCTransaction)
+		for _, txn := range txs {
+			dump[fmt.Sprintf("%d", txn.GetNonce())] = newRPCPendingTransaction(txn, curHeader, cc)
+		}
+		content["baseFee"][account.Hex()] = dump
+	}
+	// Flatten the queued transactions
+	for account, txs := range queued {
+		dump := make(map[string]*RPCTransaction)
+		for _, txn := range txs {
+			dump[fmt.Sprintf("%d", txn.GetNonce())] = newRPCPendingTransaction(txn, curHeader, cc)
+		}
+		content["queued"][account.Hex()] = dump
+	}
+	return content, nil
+}
+
+type SearchFilter struct {
+	From common.Address `json:"from"`
 }
 
 /*
